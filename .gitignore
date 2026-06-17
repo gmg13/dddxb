@@ -1,0 +1,24 @@
+# Data is never committed (size + licensing). Keep structure via .gitkeep.
+data/raw/*
+data/interim/*
+data/processed/*
+!data/**/.gitkeep
+!data/**/README.md
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets / local config
+.env
+*.local
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
