@@ -25,6 +25,13 @@ def test_extract_records_tolerates_envelopes():
     assert _extract_records({"transactions": [{"a": 1}]}) == [{"a": 1}]
     assert _extract_records({"data": {"results": [{"a": 1}]}}) == [{"a": 1}]
     assert _extract_records({"nope": 1}) == []
+    # real provider envelopes (verified 2026-06-20)
+    assert _extract_records({"success": True, "data": {"locations": [{"id": 1509}]}}) == [
+        {"id": 1509}
+    ]
+    assert _extract_records({"success": True, "data": {"properties": [{"id": "11567965"}]}}) == [
+        {"id": "11567965"}
+    ]
 
 
 def test_first_is_case_insensitive_and_skips_empty():

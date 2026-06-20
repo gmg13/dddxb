@@ -41,10 +41,12 @@ KEY_ENV_FALLBACK = "BAYUT_API_KEY"
 RAW_DIR = Path("data/raw/bayut_dld")
 INTERIM_DIR = Path("data/interim")
 
-# Candidate keys for the record list inside a response envelope.
+# Candidate keys for the record list inside a response envelope. The provider
+# nests under data.{locations,properties,...}; _extract_records recurses into the
+# `data` dict and matches these (verified 2026-06-20 for autocomplete/listings).
 _RECORD_KEYS = (
     "records", "data", "result", "results", "rows", "items",
-    "hits", "transactions", "properties", "list",
+    "hits", "transactions", "properties", "locations", "list",
 )
 # Candidate field names, finalised after the first probe.
 _DATE_KEYS = (
