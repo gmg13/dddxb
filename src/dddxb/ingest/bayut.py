@@ -22,6 +22,8 @@ from pathlib import Path
 
 import httpx
 
+from dddxb.ingest import config
+
 log = logging.getLogger(__name__)
 
 RAW_DIR = Path("data/raw/bayut")
@@ -36,11 +38,13 @@ class BayutClientError(RuntimeError):
 
 
 def _require_key() -> str:
-    key = os.environ.get("BAYUT_API_KEY")
+    # One RapidAPI key serves every subscribed API; accept the shared name too.
+    # Prefers a shell export / *_CMD secret manager over an on-disk .env.
+    key = config.get_secret("BAYUT_API_KEY") or config.get_secret("RAPIDAPI_KEY")
     if not key:
         raise BayutClientError(
-            "BAYUT_API_KEY is not set. Listings acquisition is deferred until a key "
-            "is available — see docs/data-sources.md for how to obtain one."
+            "Neither BAYUT_API_KEY nor RAPIDAPI_KEY is set. Listings acquisition is "
+            "deferred until a key is available — see docs/data-sources.md."
         )
     return key
 

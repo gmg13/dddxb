@@ -43,6 +43,12 @@ def main(argv: list[str] | None = None) -> int:
         "--refresh", action="store_true", help="(csv route) re-download even if cached"
     )
     parser.add_argument(
+        "--proxy",
+        default=None,
+        help="(csv route) proxy URL for the UAE-gated CSV host, e.g. "
+        "http://user:pass@host:port (country=AE). Falls back to DDDXB_PROXY in .env",
+    )
+    parser.add_argument(
         "--include-listings",
         action="store_true",
         help="also pull Bayut listings (requires BAYUT_API_KEY)",
@@ -74,7 +80,9 @@ def main(argv: list[str] | None = None) -> int:
             client.close()
     else:  # csv
         for dataset in datasets:
-            csv_path = dubai_pulse.download_dataset(dataset, refresh=args.refresh)
+            csv_path = dubai_pulse.download_dataset(
+                dataset, refresh=args.refresh, proxy=args.proxy
+            )
             dubai_pulse.filter_recent(dataset, csv_path, months=args.months)
 
     if args.include_listings:

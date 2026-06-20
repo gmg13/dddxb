@@ -6,9 +6,23 @@ from datetime import date
 
 import duckdb
 
+from dddxb.ingest.config import get_secret
 from dddxb.ingest.dubai_pulse import filter_recent
 from dddxb.ingest.dubai_pulse_api import _extract_records, _row_in_window
 from dddxb.ingest.sources import DubaiPulseDataset, window_start
+
+
+def test_get_secret_prefers_env_then_cmd(monkeypatch):
+    # 1. shell export wins
+    monkeypatch.setenv("DDDXB_TESTSECRET", "from-env")
+    assert get_secret("DDDXB_TESTSECRET") == "from-env"
+    # 2. *_CMD used when the var itself is unset (secret stays off-disk)
+    monkeypatch.delenv("DDDXB_TESTSECRET", raising=False)
+    monkeypatch.setenv("DDDXB_TESTSECRET_CMD", "printf cmd-secret")
+    assert get_secret("DDDXB_TESTSECRET") == "cmd-secret"
+    # 3. unset everything -> None
+    monkeypatch.delenv("DDDXB_TESTSECRET_CMD", raising=False)
+    assert get_secret("DDDXB_TESTSECRET_MISSING") is None
 
 
 def test_window_start_six_months():

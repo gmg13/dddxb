@@ -17,6 +17,7 @@ from pathlib import Path
 import duckdb
 import httpx
 
+from dddxb.ingest.config import resolve_proxy
 from dddxb.ingest.sources import DubaiPulseDataset, window_start
 
 log = logging.getLogger(__name__)
@@ -33,10 +34,16 @@ def download_dataset(
     *,
     refresh: bool = False,
     dest_dir: Path = RAW_DIR,
+    proxy: str | None = None,
 ) -> Path:
     """Stream the dataset's CSV dump to ``dest_dir/<name>.csv``.
 
     Cached: if the file already exists and ``refresh`` is False, returns it as-is.
+
+    The keyless CSV host is gated to UAE telco networks. Pass ``proxy`` (or set
+    ``DDDXB_PROXY`` in ``.env``) to route the download through a UAE residential
+    proxy so it exits on an Etisalat/du IP; otherwise the host 301-redirects to
+    the internal ``data.dubai`` mirror and the download fails.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"{dataset.name}.csv"
@@ -44,21 +51,29 @@ def download_dataset(
         log.info("cached, skipping download: %s (%.1f MB)", dest, dest.stat().st_size / 1e6)
         return dest
 
-    log.info("downloading %s -> %s", dataset.csv_url, dest)
+    proxy = resolve_proxy(proxy)
+    log.info("downloading %s -> %s%s", dataset.csv_url, dest,
+             " (via proxy)" if proxy else "")
     tmp = dest.with_name(dest.name + ".part")
     done = 0
-    with httpx.stream(
-        "GET", dataset.csv_url, timeout=_TIMEOUT, follow_redirects=True
-    ) as resp:
-        resp.raise_for_status()
-        total = int(resp.headers.get("content-length", 0))
-        with tmp.open("wb") as fh:
-            for chunk in resp.iter_bytes(chunk_size=1 << 20):
-                fh.write(chunk)
-                done += len(chunk)
-                if total and done % (50 << 20) < (1 << 20):
-                    log.info("  %.0f%% (%.1f / %.1f MB)", 100 * done / total,
-                             done / 1e6, total / 1e6)
+    with httpx.Client(timeout=_TIMEOUT, follow_redirects=True, proxy=proxy) as client:
+        with client.stream("GET", dataset.csv_url) as resp:
+            final = str(resp.url)
+            if "data.dubai" in final or "dubaipulse" not in final:
+                raise RuntimeError(
+                    f"redirected to {final!r} — the request did not exit on a UAE "
+                    "telco IP. Set DDDXB_PROXY to a UAE residential proxy "
+                    "(country=AE); see docs/data-sources.md."
+                )
+            resp.raise_for_status()
+            total = int(resp.headers.get("content-length", 0))
+            with tmp.open("wb") as fh:
+                for chunk in resp.iter_bytes(chunk_size=1 << 20):
+                    fh.write(chunk)
+                    done += len(chunk)
+                    if total and done % (50 << 20) < (1 << 20):
+                        log.info("  %.0f%% (%.1f / %.1f MB)", 100 * done / total,
+                                 done / 1e6, total / 1e6)
     tmp.replace(dest)
     log.info("downloaded %s (%.1f MB)", dest, dest.stat().st_size / 1e6)
     return dest

@@ -1,13 +1,18 @@
 # Data sources
 
 Verified access notes for transactions, rentals, and listings. Status as of
-**2026-06-18**. The ingest code for these lives in `src/dddxb/ingest/`.
+**2026-06-20**. The ingest code for these lives in `src/dddxb/ingest/`.
 
-> Network note: from the current dev machine, `www.dubaipulse.gov.ae` (the keyless
-> CSV-dump host) is **firewalled** (TCP connect times out), while
-> `api.dubaipulse.gov.ae` (the open-data API host) **is reachable**. Other UAE sites
-> (e.g. `dubailand.gov.ae`) work, so this is a host-specific block, not a geo-block.
-> The project therefore defaults to the **API route** (`--via api`).
+> Network note (updated 2026-06-20): `www.dubaipulse.gov.ae` **301-redirects all
+> traffic to `data.dubai`** (an Etisalat-internal mirror at `213.42.53.227`) unless
+> the request originates on a **UAE telco (Etisalat/du) network**; `data.dubai`
+> drops the TLS handshake for any other source. A commercial VPN does **not** help
+> — its datacenter IP (e.g. NordVPN/M247) is treated as outside the telco network.
+> The gate is by **ISP/ASN, not geolocation**. `api.dubaipulse.gov.ae` is reachable
+> globally (returns `401`, not a redirect) but needs a key from the gated portal.
+> To skip the gate entirely the project supports a **non-geo-blocked RapidAPI route**
+> (see below), and — for a UAE residential proxy — a proxy-aware CSV route
+> (`--via csv --proxy …`).
 
 ## Transactions (primary) — DLD via Dubai Pulse *open data*
 
@@ -60,6 +65,38 @@ per year** and gated on a Dubai trade licence + system registration. Its "Ejari"
 manages contract lifecycle and "Rental Index" returns aggregated indices — neither
 provides bulk historical microdata. **Do not use it for this project**; the free
 Dubai Pulse open data above is the correct source.
+
+## Non-geo-blocked alternative — UAE Real Estate API (RapidAPI)
+
+The Dubai Pulse CSV-dump and registration hosts (`www.dubaipulse.gov.ae`,
+`data.dubai`) are gated to **UAE telco (Etisalat/du) networks** — a commercial
+VPN's datacenter IP gets 301-redirected to a dead `data.dubai` and fails. The
+**API gateway** `api.dubaipulse.gov.ae` is reachable globally but needs a key
+minted through that gated portal.
+
+To avoid the geo-gate entirely, this project supports a third-party API that
+resells the same DLD data over RapidAPI with no UAE-network requirement:
+
+- **Product:** "UAE Real Estate" — host **`uae-real-estate3.p.rapidapi.com`**
+  (bayutapi.dev). Serves DLD sales **transactions** (`purpose=for-sale`) and
+  Ejari **rental contracts** (`purpose=for-rent`) as filtered JSON, plus current
+  **listings** (`/search-property`) and location **`/autocomplete`**.
+- **Auth:** one RapidAPI key in the `X-RapidAPI-Key` header (a single key serves
+  every API on your RapidAPI account). **Prefer not to keep secrets on disk:**
+  `export RAPIDAPI_KEY=…` for the session, or set `RAPIDAPI_KEY_CMD` to a
+  secret-manager command (`op read …`, `pass show …`) so the key never lands in a
+  file; `.env` is the convenience fallback (see `.env.example`). Client:
+  `src/dddxb/ingest/uae_realestate.py`; CLI: `python -m dddxb.ingest.uae_realestate_cli`.
+- **Plans:** Basic **free** (900 req/mo) · Pro **$20** (30,000 req, $0.003 overage)
+  · Ultra $60 (100k) · Mega $200 (500k). A microlocality-driven 6–12 month pull
+  uses ~1.5–3k calls, so **Pro is ample**; **start on Basic** to probe + validate
+  at $0 — upgrading is the same key, no code change.
+- **Workflow:** `--probe` (≈3 calls) confirms the exact field names/page size →
+  smoke-test 1–2 microlocalities on Basic → **fidelity spot-check** vs a public
+  reference (DXBinteract) before trusting figures → then the full pull.
+- ⚠️ **Third-party / unofficial.** Validate fidelity before analysis; respect ToS;
+  keep dated snapshots. The normaliser maps several likely field names and is
+  finalised from the probe output.
 
 ## Listings (current market) — Bayut / Property Finder / Dubizzle
 
