@@ -10,6 +10,8 @@ from datetime import date
 
 from dddxb.ingest.uae_realestate import (
     NORMALIZED_COLUMNS,
+    PROVIDERS,
+    _build_transactions_request,
     _coerce_date,
     _extract_records,
     _first,
@@ -17,6 +19,31 @@ from dddxb.ingest.uae_realestate import (
     _row_in_window,
     normalize_transactions,
 )
+
+
+def test_build_transactions_request_post_provider():
+    p = PROVIDERS["uae-real-estate2"]
+    method, path, params, body = _build_transactions_request(
+        p, purpose="for-sale", location_ids=["5643"],
+        start_date="2025-12-18", end_date="2026-06-18",
+    )
+    assert method == "POST" and path == "transactions"
+    assert params == {"page": 0}  # pages from 0
+    assert body["purpose"] == "for-sale"
+    assert body["locations_ids"] == ["5643"]  # array, provider-specific key
+    assert body["start_date"] == "2025-12-18" and body["end_date"] == "2026-06-18"
+
+
+def test_build_transactions_request_get_provider():
+    p = PROVIDERS["uae-real-estate3"]
+    method, path, params, body = _build_transactions_request(
+        p, purpose="for-rent", location_ids="1509", time_period="6m",
+    )
+    assert method == "GET" and body is None
+    assert params["purpose"] == "for-rent"
+    assert params["location_ids"] == "1509"  # comma-string in query
+    assert params["page"] == 1  # pages from 1
+    assert params["time_period"] == "6m"  # preset, no date range
 
 
 def test_extract_records_tolerates_envelopes():

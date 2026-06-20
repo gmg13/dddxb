@@ -1,21 +1,21 @@
-"""Client for the UAE Real Estate API on RapidAPI.
+"""Client for the UAE Real Estate APIs on RapidAPI (DLD transactions + Ejari rents).
 
-Host ``uae-real-estate3.p.rapidapi.com`` (the bayutapi.dev product). Serves DLD
-sales **transactions** and Ejari **rental contracts** as filtered JSON — a
-non-geo-blocked alternative to the Dubai Pulse open data, whose CSV/registration
-hosts are gated to UAE telco networks.
+Two interchangeable third-party providers resell the same DLD data as JSON, with
+slightly different shapes. A small :class:`Provider` registry abstracts the
+differences so we can fall back between them:
 
-Third-party / unofficial: run :func:`probe` and a fidelity spot-check against a
-public reference before trusting figures for analysis.
+- ``uae-real-estate2`` (bayutapi.com) — **default**. ``POST /transactions`` with a
+  JSON body supporting precise ``start_date``/``end_date`` filtering; pages from 0.
+- ``uae-real-estate3`` (bayutapi.dev) — ``GET /transactions`` with ``time_period``
+  presets; pages from 1. (Its transactions backend was returning 502 on 2026-06-20.)
 
-Auth is a single RapidAPI key in the ``X-RapidAPI-Key`` header — one key works
-across every API on your RapidAPI account. Set ``RAPIDAPI_KEY`` (or the
-``BAYUT_API_KEY`` fallback) in ``.env`` (gitignored).
+Both are **non-geo-blocked** (no UAE network needed) and **unofficial** (they
+harvest Bayut/DLD data) — run :func:`probe` and a fidelity spot-check before
+trusting figures.
 
-The exact response envelope, field names, page size, and ``time_period`` semantics
-are confirmed at runtime with :func:`probe`; the normaliser maps several likely
-field names and is finalised once the probe output is seen. A client-side date
-filter is always applied as the correctness backstop.
+Auth is a single RapidAPI key in ``X-RapidAPI-Key`` — one key works across every
+API you subscribe to. Resolve it off-disk where possible: ``export RAPIDAPI_KEY``
+or a ``RAPIDAPI_KEY_CMD`` secret-manager command, with ``.env`` as fallback.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -34,21 +35,68 @@ from dddxb.ingest.sources import window_start
 
 log = logging.getLogger(__name__)
 
-HOST = "uae-real-estate3.p.rapidapi.com"
 KEY_ENV = "RAPIDAPI_KEY"
 KEY_ENV_FALLBACK = "BAYUT_API_KEY"
 
 RAW_DIR = Path("data/raw/bayut_dld")
 INTERIM_DIR = Path("data/interim")
 
-# Candidate keys for the record list inside a response envelope. The provider
-# nests under data.{locations,properties,...}; _extract_records recurses into the
-# `data` dict and matches these (verified 2026-06-20 for autocomplete/listings).
+
+@dataclass(frozen=True)
+class Provider:
+    """Per-provider endpoint shape (RapidAPI host + path/method differences)."""
+
+    name: str
+    host: str
+    locations_path: str
+    transactions_path: str
+    transactions_method: str  # "GET" | "POST"
+    listings_path: str
+    listings_method: str  # "GET" | "POST"
+    location_param: str  # request key for location ids
+    period_param: str  # preset-window param name
+    supports_date_range: bool  # start_date/end_date filtering
+    page_base: int  # first page index (0 or 1)
+
+
+PROVIDERS: dict[str, Provider] = {
+    "uae-real-estate2": Provider(
+        name="uae-real-estate2",
+        host="uae-real-estate2.p.rapidapi.com",
+        locations_path="locations_search",
+        transactions_path="transactions",
+        transactions_method="POST",
+        listings_path="properties_search",
+        listings_method="POST",
+        location_param="locations_ids",
+        period_param="time_frame",
+        supports_date_range=True,
+        page_base=0,
+    ),
+    "uae-real-estate3": Provider(
+        name="uae-real-estate3",
+        host="uae-real-estate3.p.rapidapi.com",
+        locations_path="autocomplete",
+        transactions_path="transactions",
+        transactions_method="GET",
+        listings_path="search-property",
+        listings_method="GET",
+        location_param="location_ids",
+        period_param="time_period",
+        supports_date_range=False,
+        page_base=1,
+    ),
+}
+DEFAULT_PROVIDER = "uae-real-estate2"  # up + precise date filtering
+
+# Candidate keys for the record list inside a response envelope. Providers nest
+# under data.{locations,properties,transactions,...}; _extract_records recurses
+# into `data` and matches these (verified 2026-06-20 for autocomplete/listings).
 _RECORD_KEYS = (
     "records", "data", "result", "results", "rows", "items",
     "hits", "transactions", "properties", "locations", "list",
 )
-# Candidate field names, finalised after the first probe.
+# Candidate field names, finalised after the first probe of a live endpoint.
 _DATE_KEYS = (
     "date", "transaction_date", "instance_date", "contract_date",
     "contract_start_date", "registration_date", "created_at", "evidence_date",
@@ -58,7 +106,7 @@ _AREA_KEYS = ("area", "location", "community", "area_name", "area_name_en", "nei
 _TYPE_KEYS = ("category", "property_type", "type", "category_name", "property_sub_type")
 _SIZE_KEYS = ("size", "area_sqft", "builtup_area", "size_sqft", "sqft", "procedure_area")
 _BEDS_KEYS = ("beds", "bedrooms", "rooms", "bedroom", "no_of_rooms")
-_LOCID_KEYS = ("id", "externalID", "external_id", "location_id", "locationId", "value")
+_LOCID_KEYS = ("externalID", "external_id", "id", "location_id", "locationId", "value")
 
 NORMALIZED_COLUMNS = (
     "microlocality", "purpose", "date", "price", "area", "property_type", "size", "beds",
@@ -74,7 +122,7 @@ def _require_key() -> str:
     key = config.get_secret(KEY_ENV) or config.get_secret(KEY_ENV_FALLBACK)
     if not key:
         raise UAERealEstateError(
-            f"{KEY_ENV} (or {KEY_ENV_FALLBACK}) is not set. Subscribe to the UAE Real "
+            f"{KEY_ENV} (or {KEY_ENV_FALLBACK}) is not set. Subscribe to a UAE Real "
             "Estate API on RapidAPI (Basic is free), then either `export "
             f"{KEY_ENV}=…`, set `{KEY_ENV}_CMD` to a secret-manager command, or put "
             "it in .env; see docs/data-sources.md."
@@ -82,26 +130,72 @@ def _require_key() -> str:
     return key
 
 
+def _build_transactions_request(
+    provider: Provider,
+    *,
+    purpose: str,
+    location_ids: list[str] | str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    time_period: str | None = None,
+    page: int | None = None,
+    extra: dict | None = None,
+) -> tuple[str, str, dict, dict | None]:
+    """Build ``(method, path, params, json_body)`` for a transactions request.
+
+    Pure (no I/O) so the per-provider GET-query vs POST-body shaping is testable.
+    """
+    page = provider.page_base if page is None else page
+    filters: dict[str, object] = {"purpose": purpose}
+    if location_ids:
+        if provider.transactions_method == "POST":
+            filters[provider.location_param] = (
+                [location_ids] if isinstance(location_ids, str) else list(location_ids)
+            )
+        else:
+            filters[provider.location_param] = (
+                location_ids if isinstance(location_ids, str)
+                else ",".join(str(i) for i in location_ids)
+            )
+    if provider.supports_date_range and (start_date or end_date):
+        if start_date:
+            filters["start_date"] = start_date
+        if end_date:
+            filters["end_date"] = end_date
+    elif time_period and provider.period_param:
+        filters[provider.period_param] = time_period
+    if extra:
+        filters.update(extra)
+
+    if provider.transactions_method == "POST":
+        return "POST", provider.transactions_path, {"page": page}, filters
+    return "GET", provider.transactions_path, {**filters, "page": page}, None
+
+
 class UAERealEstateClient:
-    """Thin RapidAPI client with throttling, 429 backoff, and a call budget."""
+    """Provider-aware RapidAPI client with throttling, 429 backoff, call budget."""
 
     def __init__(
         self,
         *,
+        provider: str | Provider = DEFAULT_PROVIDER,
         key: str | None = None,
-        host: str = HOST,
         min_interval: float = 0.25,
         max_calls: int | None = None,
     ):
-        self._host = host
-        self._headers = {"X-RapidAPI-Key": key or _require_key(), "X-RapidAPI-Host": host}
+        self.provider = provider if isinstance(provider, Provider) else PROVIDERS[provider]
+        self._headers = {
+            "X-RapidAPI-Key": key or _require_key(),
+            "X-RapidAPI-Host": self.provider.host,
+        }
         self._client = httpx.Client(timeout=httpx.Timeout(30.0, read=60.0))
         self._min_interval = min_interval
         self._last = 0.0
         self.calls = 0
         self.max_calls = max_calls
 
-    def _get(self, path: str, params: dict) -> object:
+    def _request(self, method: str, path: str, *, params: dict | None = None,
+                 json_body: dict | None = None) -> object:
         if self.max_calls is not None and self.calls >= self.max_calls:
             raise UAERealEstateError(
                 f"call budget exhausted ({self.max_calls}); aborting to protect quota"
@@ -109,9 +203,11 @@ class UAERealEstateClient:
         wait = self._min_interval - (time.monotonic() - self._last)
         if wait > 0:
             time.sleep(wait)
-        url = f"https://{self._host}/{path.lstrip('/')}"
+        url = f"https://{self.provider.host}/{path.lstrip('/')}"
         for attempt in range(4):
-            resp = self._client.get(url, headers=self._headers, params=params)
+            resp = self._client.request(
+                method, url, headers=self._headers, params=params, json=json_body
+            )
             self._last = time.monotonic()
             self.calls += 1
             if resp.status_code == 429:
@@ -125,8 +221,8 @@ class UAERealEstateClient:
 
     # -- reads ----------------------------------------------------------------
     def autocomplete(self, query: str) -> object:
-        """Location autocomplete → records carrying location ids."""
-        return self._get("autocomplete", {"query": query})
+        """Location search → records carrying location ids."""
+        return self._request("GET", self.provider.locations_path, params={"query": query})
 
     def location_id(self, query: str) -> str | None:
         """Best-match location id for a microlocality name, or None."""
@@ -141,38 +237,38 @@ class UAERealEstateClient:
         *,
         purpose: str = "for-sale",
         location_ids: list[str] | str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
         time_period: str | None = None,
-        page: int = 1,
+        page: int | None = None,
         extra: dict | None = None,
     ) -> object:
-        """One page of DLD transactions (purpose=for-sale) / Ejari rents (for-rent)."""
-        params: dict[str, object] = {"purpose": purpose, "page": page}
-        if location_ids:
-            params["location_ids"] = (
-                location_ids if isinstance(location_ids, str)
-                else ",".join(str(i) for i in location_ids)
-            )
-        if time_period:
-            params["time_period"] = time_period
-        if extra:
-            params.update(extra)
-        return self._get("transactions", params)
+        """One page of DLD transactions (for-sale) / Ejari rents (for-rent)."""
+        method, path, params, body = _build_transactions_request(
+            self.provider, purpose=purpose, location_ids=location_ids,
+            start_date=start_date, end_date=end_date, time_period=time_period,
+            page=page, extra=extra,
+        )
+        return self._request(method, path, params=params, json_body=body)
 
     def iter_transactions(
         self,
         *,
         purpose: str,
         location_ids: list[str] | str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
         time_period: str | None = None,
         max_pages: int = 200,
     ):
         """Yield transaction records across pages, stopping on a short/empty page."""
+        base = self.provider.page_base
         page_size: int | None = None
-        for page in range(1, max_pages + 1):
+        for i in range(max_pages):
             rows = _extract_records(
                 self.transactions(
-                    purpose=purpose, location_ids=location_ids,
-                    time_period=time_period, page=page,
+                    purpose=purpose, location_ids=location_ids, start_date=start_date,
+                    end_date=end_date, time_period=time_period, page=base + i,
                 )
             )
             if not rows:
@@ -182,18 +278,6 @@ class UAERealEstateClient:
                 page_size = len(rows)
             if len(rows) < page_size:
                 break
-
-    def search_property(
-        self, *, purpose: str = "for-sale", location_ids: list[str] | str | None = None, page: int = 1
-    ) -> object:
-        """One page of current asking listings (optional live-market layer)."""
-        params: dict[str, object] = {"purpose": purpose, "page": page}
-        if location_ids:
-            params["location_ids"] = (
-                location_ids if isinstance(location_ids, str)
-                else ",".join(str(i) for i in location_ids)
-            )
-        return self._get("search-property", params)
 
     def close(self) -> None:
         self._client.close()
@@ -209,8 +293,7 @@ def _extract_records(payload: object) -> list[dict]:
             value = payload.get(key)
             if isinstance(value, list):
                 return [r for r in value if isinstance(r, dict)]
-        # single nested object, e.g. {"data": {"hits": [...]}}
-        for value in payload.values():
+        for value in payload.values():  # e.g. {"data": {"locations": [...]}}
             if isinstance(value, dict):
                 nested = _extract_records(value)
                 if nested:
@@ -310,12 +393,13 @@ def pull(
 ) -> dict[str, Path]:
     """Pull transactions per microlocality × purpose; write normalised parquet.
 
-    Saves the raw records to ``raw_dir`` as JSONL (lossless audit trail) and the
+    Saves raw records to ``raw_dir`` as JSONL (lossless audit trail) and the
     normalised window to ``out_dir`` as parquet. Returns ``{purpose: parquet_path}``.
     """
     own = client is None
     client = client or UAERealEstateClient()
     start = window_start(months)
+    start_date, end_date = start.isoformat(), date.today().isoformat()
     time_period = f"{months}m"
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -334,8 +418,8 @@ def pull(
                     log.warning("no location id for %r; skipping", name)
                     continue
                 for row in client.iter_transactions(
-                    purpose=purpose, location_ids=[lid],
-                    time_period=time_period, max_pages=max_pages,
+                    purpose=purpose, location_ids=[lid], start_date=start_date,
+                    end_date=end_date, time_period=time_period, max_pages=max_pages,
                 ):
                     if _row_in_window(row, start):
                         row["_microlocality"] = name

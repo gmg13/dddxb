@@ -20,11 +20,19 @@ import sys
 
 import httpx
 
-from dddxb.ingest.uae_realestate import UAERealEstateClient, UAERealEstateError, pull
+from dddxb.ingest.uae_realestate import (
+    DEFAULT_PROVIDER,
+    PROVIDERS,
+    UAERealEstateClient,
+    UAERealEstateError,
+    pull,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dddxb.ingest.uae_realestate_cli", description=__doc__)
+    parser.add_argument("--provider", choices=sorted(PROVIDERS), default=DEFAULT_PROVIDER,
+                        help=f"RapidAPI provider (default: {DEFAULT_PROVIDER})")
     parser.add_argument("--probe", action="store_true",
                         help="fetch a tiny sample (autocomplete + 1 page sale/rent) and print it")
     parser.add_argument("--query", default="Dubai", help="(probe) autocomplete query string")
@@ -43,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     try:
-        client = UAERealEstateClient(max_calls=args.max_calls)
+        client = UAERealEstateClient(provider=args.provider, max_calls=args.max_calls)
     except UAERealEstateError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
