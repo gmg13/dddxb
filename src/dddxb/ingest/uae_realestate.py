@@ -130,6 +130,17 @@ def _require_key() -> str:
     return key
 
 
+_SUPPORTED_PERIODS = (1, 3, 6, 12, 36)
+
+
+def _snap_period(months: int) -> str:
+    """Snap a month count up to the nearest supported preset (1/3/6/12/36m)."""
+    for period in _SUPPORTED_PERIODS:
+        if months <= period:
+            return f"{period}m"
+    return f"{_SUPPORTED_PERIODS[-1]}m"
+
+
 def _build_transactions_request(
     provider: Provider,
     *,
@@ -204,20 +215,25 @@ class UAERealEstateClient:
         if wait > 0:
             time.sleep(wait)
         url = f"https://{self.provider.host}/{path.lstrip('/')}"
-        for attempt in range(4):
+        attempts = 5
+        for attempt in range(attempts):
             resp = self._client.request(
                 method, url, headers=self._headers, params=params, json=json_body
             )
             self._last = time.monotonic()
             self.calls += 1
-            if resp.status_code == 429:
+            # 429 (rate limit) and 5xx (provider hiccups — this API 500s
+            # intermittently) are retryable with backoff; 4xx are not.
+            retryable = resp.status_code == 429 or 500 <= resp.status_code < 600
+            if retryable and attempt < attempts - 1:
                 back = 2 ** attempt
-                log.warning("429 rate limited on %s; backing off %ss", path, back)
+                log.warning("%s on %s; retry %d/%d after %ss",
+                            resp.status_code, path, attempt + 1, attempts - 1, back)
                 time.sleep(back)
                 continue
             resp.raise_for_status()
             return resp.json()
-        raise UAERealEstateError("repeated 429s; slow down (raise min_interval) or upgrade plan")
+        raise UAERealEstateError(f"exhausted retries on {path}")
 
     # -- reads ----------------------------------------------------------------
     def autocomplete(self, query: str) -> object:
@@ -351,31 +367,66 @@ def _coerce_date(value) -> date | None:
         return None
 
 
+def _dig(row: object, *path: str):
+    """Walk a nested dict by key path; None if any hop is missing."""
+    cur = row
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _pick(*values):
+    """First non-empty value."""
+    for value in values:
+        if value not in (None, "", []):
+            return value
+    return None
+
+
 def _row_in_window(row: dict, start: date) -> bool:
-    parsed = _coerce_date(_first(row, *_DATE_KEYS))
+    parsed = _coerce_date(_pick(_dig(row, "date"), _first(row, *_DATE_KEYS)))
     return parsed is not None and parsed >= start
+
+
+def _normalize_record(r: dict, *, purpose: str) -> dict:
+    """One raw transaction → canonical row.
+
+    Handles the uae-real-estate2 nested shape (``amount``/``date`` top-level,
+    ``property.{type,beds,builtup_area.sqft}``, ``location.full_location``) and
+    falls back to flat field-name guesses for other providers. Verified against
+    live data 2026-06-22.
+    """
+    flat_area = _first(r, *_AREA_KEYS)
+    beds = _pick(_dig(r, "property", "beds"), _first(r, *_BEDS_KEYS))
+    return {
+        "microlocality": r.get("_microlocality"),
+        "purpose": purpose,
+        "date": _coerce_date(_pick(_dig(r, "date"), _first(r, *_DATE_KEYS))),
+        "price": _num(_pick(_dig(r, "amount"), _first(r, *_PRICE_KEYS))),
+        "area": _pick(
+            _dig(r, "location", "full_location"),
+            _dig(r, "location", "location"),
+            flat_area if isinstance(flat_area, str) else None,
+        ),
+        "property_type": _pick(_dig(r, "property", "type"), _first(r, *_TYPE_KEYS)),
+        "size": _num(_pick(
+            _dig(r, "property", "builtup_area", "sqft"),
+            _dig(r, "property", "plot_area", "sqft"),
+            _first(r, *_SIZE_KEYS),
+        )),
+        "beds": str(beds) if beds not in (None, "") else None,
+    }
 
 
 def normalize_transactions(records: list[dict], *, purpose: str) -> pl.DataFrame:
     """Map raw records to the canonical schema the clean/features stages expect.
 
-    Best-effort until the probe confirms exact field names; unmapped fields land
-    as null. Always returns the full :data:`NORMALIZED_COLUMNS` set so empty pulls
-    still write a valid, schema-stable parquet.
+    Always returns the full :data:`NORMALIZED_COLUMNS` set so empty pulls still
+    write a valid, schema-stable parquet.
     """
-    rows = [
-        {
-            "microlocality": r.get("_microlocality"),
-            "purpose": purpose,
-            "date": _coerce_date(_first(r, *_DATE_KEYS)),
-            "price": _num(_first(r, *_PRICE_KEYS)),
-            "area": _first(r, *_AREA_KEYS),
-            "property_type": _first(r, *_TYPE_KEYS),
-            "size": _num(_first(r, *_SIZE_KEYS)),
-            "beds": _first(r, *_BEDS_KEYS),
-        }
-        for r in records
-    ]
+    rows = [_normalize_record(r, purpose=purpose) for r in records]
     if not rows:
         return pl.DataFrame({c: [] for c in NORMALIZED_COLUMNS})
     return pl.DataFrame(rows).select(NORMALIZED_COLUMNS)
@@ -399,8 +450,11 @@ def pull(
     own = client is None
     client = client or UAERealEstateClient()
     start = window_start(months)
-    start_date, end_date = start.isoformat(), date.today().isoformat()
-    time_period = f"{months}m"
+    # Use the time_frame/time_period preset for both purposes: uae-real-estate2's
+    # for-rent endpoint 500s on start_date/end_date, while the preset works for
+    # both. The client-side window filter below adds precision. (presets:
+    # 1m/3m/6m/12m/36m — snap up to the next supported preset.)
+    time_period = _snap_period(months)
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
     results: dict[str, Path] = {}
@@ -417,13 +471,17 @@ def pull(
                 if lid is None:
                     log.warning("no location id for %r; skipping", name)
                     continue
-                for row in client.iter_transactions(
-                    purpose=purpose, location_ids=[lid], start_date=start_date,
-                    end_date=end_date, time_period=time_period, max_pages=max_pages,
-                ):
-                    if _row_in_window(row, start):
-                        row["_microlocality"] = name
-                        kept.append(row)
+                try:
+                    for row in client.iter_transactions(
+                        purpose=purpose, location_ids=[lid],
+                        time_period=time_period, max_pages=max_pages,
+                    ):
+                        if _row_in_window(row, start):
+                            row["_microlocality"] = name
+                            kept.append(row)
+                except (httpx.HTTPStatusError, UAERealEstateError) as exc:
+                    # Keep partial data and move on — the provider 5xx's at times.
+                    log.warning("partial: %s/%s stopped early (%s)", name, purpose, exc)
 
             raw_path = raw_dir / f"{slug}_last{months}m.jsonl"
             with raw_path.open("w") as fh:

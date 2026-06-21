@@ -17,8 +17,44 @@ from dddxb.ingest.uae_realestate import (
     _first,
     _num,
     _row_in_window,
+    _snap_period,
     normalize_transactions,
 )
+
+# A real uae-real-estate2 record (shape verified live 2026-06-22).
+_REAL_RECORD = {
+    "_microlocality": "Al Jaddaf",
+    "id": "10b1417197976805",
+    "amount": "759330.00",
+    "category": "Sales",
+    "date": "2026-06-19",
+    "property": {
+        "floor": "4", "beds": "0", "type": "apartments",
+        "builtup_area": {"sqft": 329.48}, "plot_area": {"sqft": None},
+    },
+    "location": {"id": 89513, "location": "Azizi David",
+                 "full_location": "Al Jaddaf -> Azizi David"},
+}
+
+
+def test_snap_period_rounds_up_to_supported_preset():
+    assert _snap_period(6) == "6m"
+    assert _snap_period(2) == "3m"
+    assert _snap_period(12) == "12m"
+    assert _snap_period(99) == "36m"
+
+
+def test_normalize_real_nested_record():
+    frame = normalize_transactions([_REAL_RECORD], purpose="for-sale")
+    assert frame.columns == list(NORMALIZED_COLUMNS)
+    row = frame.row(0, named=True)
+    assert row["microlocality"] == "Al Jaddaf"
+    assert row["date"] == date(2026, 6, 19)
+    assert row["price"] == 759330.0
+    assert row["area"] == "Al Jaddaf -> Azizi David"
+    assert row["property_type"] == "apartments"
+    assert row["size"] == 329.48
+    assert row["beds"] == "0"
 
 
 def test_build_transactions_request_post_provider():

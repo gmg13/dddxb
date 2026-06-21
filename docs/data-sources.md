@@ -98,6 +98,24 @@ resells the same DLD data over RapidAPI with no UAE-network requirement:
   keep dated snapshots. The normaliser maps several likely field names and is
   finalised from the probe output.
 
+### Verified live 2026-06-22 (provider `uae-real-estate2`, the default)
+
+- `POST /transactions` returns `{results:[...], count, page}`; records are nested:
+  `amount`, `date` (YYYY-MM-DD), `category`, `property.{type,beds,builtup_area.sqft}`,
+  `location.full_location` ("Al Jaddaf -> Azizi David"), `contract.*`. Pages from 0.
+- Use the **`time_frame` preset** (1/3/6/12/36m) for **both** purposes. The for-rent
+  endpoint **500s on `start_date`/`end_date`** and also **500s intermittently per
+  page** — the client retries 5xx with backoff and the pull keeps partial data, so
+  rent coverage for some locations can be incomplete (logged as `partial:`).
+- ⚠️ **Rent `date` is the contract date (often future), not the registration date.**
+  `time_frame` scopes by registration recency server-side, but the exposed date is
+  the tenancy term — good for *current market rent level* (yield), not a trailing
+  registration window. Confirm semantics in the fidelity check; see
+  `ideas/0001` "yield basis" open question.
+- Smoke test (Al Jaddaf + Business Bay, 6m): clean canonical parquet, zero nulls;
+  sale median ~1.5M AED, rent median ~86k AED/yr — both plausible. One ~200M AED
+  sale = likely a bulk deal → rely on cohort medians/outlier rules.
+
 ## Listings (current market) — Bayut / Property Finder / Dubizzle
 
 Live asking prices/rents. **There is no official public Bayut _listings_ data API.**
