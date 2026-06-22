@@ -217,9 +217,20 @@ class UAERealEstateClient:
         url = f"https://{self.provider.host}/{path.lstrip('/')}"
         attempts = 5
         for attempt in range(attempts):
-            resp = self._client.request(
-                method, url, headers=self._headers, params=params, json=json_body
-            )
+            try:
+                resp = self._client.request(
+                    method, url, headers=self._headers, params=params, json=json_body
+                )
+            except httpx.TransportError as exc:
+                # Timeouts / connection resets — transient; retry with backoff.
+                self.calls += 1
+                if attempt < attempts - 1:
+                    back = 2 ** attempt
+                    log.warning("transport error on %s (%s); retry %d/%d after %ss",
+                                path, type(exc).__name__, attempt + 1, attempts - 1, back)
+                    time.sleep(back)
+                    continue
+                raise
             self._last = time.monotonic()
             self.calls += 1
             # 429 (rate limit) and 5xx (provider hiccups — this API 500s
@@ -479,8 +490,9 @@ def pull(
                         if _row_in_window(row, start):
                             row["_microlocality"] = name
                             kept.append(row)
-                except (httpx.HTTPStatusError, UAERealEstateError) as exc:
-                    # Keep partial data and move on — the provider 5xx's at times.
+                except (httpx.HTTPError, UAERealEstateError) as exc:
+                    # Keep partial data and move on — the provider 5xx's and drops
+                    # connections at times (httpx.HTTPError covers status + transport).
                     log.warning("partial: %s/%s stopped early (%s)", name, purpose, exc)
 
             raw_path = raw_dir / f"{slug}_last{months}m.jsonl"

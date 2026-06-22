@@ -76,6 +76,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: API returned {exc.response.status_code}: "
               f"{exc.response.text[:300]}", file=sys.stderr)
         return 1
+    except httpx.HTTPError as exc:
+        print(f"error: request failed ({type(exc).__name__}): {exc}", file=sys.stderr)
+        return 1
     finally:
         print(f"\nAPI calls used this run: {client.calls}")
         client.close()
