@@ -25,9 +25,15 @@ from datetime import date, timedelta
 
 import polars as pl
 
-from dddxb.clean.transactions import COHORT_KEYS
+from dddxb.clean.transactions import COHORT_KEYS, clean_sales
 
 log = logging.getLogger(__name__)
+
+
+def _month_index(ym: str) -> int:
+    """'YYYY-MM' -> absolute month number, for differencing."""
+    y, m = ym.split("-")
+    return int(y) * 12 + int(m) - 1
 
 # Default operating-cost haircut on gross rent (service charge + vacancy +
 # management). Documented placeholder — vary in sensitivity analysis.
@@ -98,6 +104,89 @@ def build_cohort_metrics(
                 (pl.col("n_sales") < min_cohort) | (pl.col("n_rents") < min_cohort)
             ).alias("thin"),
         )
+        .sort("total_return", descending=True)
+    )
+    return out
+
+
+def monthly_psf(history: pl.DataFrame, *, min_per_month: int = 5) -> pl.DataFrame:
+    """Median AED/sqft per microlocality per month from the sale-history sample.
+
+    Cleans first (trims outliers, adds psf), then keeps only months with enough
+    sales for a stable median. psf controls for unit-size mix across months.
+    """
+    df = clean_sales(history)
+    return (
+        df.with_columns(pl.col("date").dt.strftime("%Y-%m").alias("ym"))
+        .group_by(["microlocality", "ym"])
+        .agg(pl.len().alias("n"), pl.col("psf").median().alias("psf"))
+        .filter(pl.col("n") >= min_per_month)
+        .sort(["microlocality", "ym"])
+    )
+
+
+def appreciation_from_history(
+    history: pl.DataFrame,
+    *,
+    windows: tuple[int, ...] = (3, 6, 12),
+    min_per_month: int = 5,
+) -> pl.DataFrame:
+    """Annualized appreciation per microlocality from the monthly psf series.
+
+    For each trailing window ``w`` (months): ``(psf_latest / psf_{latest-w})^(12/w) - 1``
+    using each microlocality's latest month as the anchor (nearest month within ±1
+    used if an exact target month is missing). Also a long-run CAGR over the full
+    covered span. Methodology: docs/methodology.md.
+    """
+    series = monthly_psf(history, min_per_month=min_per_month)
+    rows: list[dict] = []
+    for name in series["microlocality"].unique().to_list():
+        g = series.filter(pl.col("microlocality") == name)
+        psf = {r["ym"]: r["psf"] for r in g.iter_rows(named=True)}
+        idx = {ym: _month_index(ym) for ym in psf}
+        if not psf:
+            continue
+        latest = max(psf, key=lambda k: idx[k])
+        latest_i, psf_latest = idx[latest], psf[latest]
+
+        def psf_near(target_i: int, tol: int = 1):
+            cands = [ym for ym, i in idx.items() if abs(i - target_i) <= tol]
+            if not cands:
+                return None
+            return psf[min(cands, key=lambda ym: abs(idx[ym] - target_i))]
+
+        rec = {"microlocality": name, "psf_latest": psf_latest, "months_covered": len(psf)}
+        for w in windows:
+            start = psf_near(latest_i - w)
+            rec[f"ann_appr_{w}m"] = (
+                (psf_latest / start) ** (12.0 / w) - 1 if start and start > 0 else None
+            )
+        earliest = min(psf, key=lambda k: idx[k])
+        span = latest_i - idx[earliest]
+        rec["cagr"] = (
+            (psf_latest / psf[earliest]) ** (12.0 / span) - 1
+            if span >= 12 and psf[earliest] > 0 else None
+        )
+        rows.append(rec)
+    return pl.DataFrame(rows)
+
+
+def apply_history_appreciation(
+    ranking: pl.DataFrame, history: pl.DataFrame, *, headline_window: int = 12
+) -> pl.DataFrame:
+    """Replace the ranking's appreciation with the reliable history-based figure.
+
+    Uses the ``headline_window``-month annualized appreciation as ``ann_appr`` and
+    recomputes ``total_return = net_yield + ann_appr``; carries ``cagr`` too.
+    """
+    appr = appreciation_from_history(history, windows=(3, 6, headline_window))
+    col = f"ann_appr_{headline_window}m"
+    out = (
+        ranking.join(appr.select(["microlocality", col, "cagr", "psf_latest"]),
+                     on="microlocality", how="left")
+        .with_columns(pl.col(col).alias("ann_appr"))
+        .with_columns((pl.col("net_yield") + pl.col("ann_appr").fill_null(0.0)).alias("total_return"))
+        .drop(col)
         .sort("total_return", descending=True)
     )
     return out

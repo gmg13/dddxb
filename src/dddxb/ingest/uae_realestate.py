@@ -20,6 +20,7 @@ or a ``RAPIDAPI_KEY_CMD`` secret-manager command, with ``.env`` as fallback.
 
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import time
@@ -508,3 +509,89 @@ def pull(
         if own:
             client.close()
     return results
+
+
+def month_buckets(years: int = 4, today: date | None = None) -> list[tuple[str, str, str]]:
+    """``(label, start_date, end_date)`` per month for the last ``years*12`` months.
+
+    Oldest first; dates are ISO ``YYYY-MM-DD`` (month start .. month last day).
+    """
+    today = today or date.today()
+    buckets: list[tuple[str, str, str]] = []
+    for i in range(years * 12 - 1, -1, -1):
+        total = today.year * 12 + (today.month - 1) - i
+        y, m = divmod(total, 12)
+        m += 1
+        last = calendar.monthrange(y, m)[1]
+        buckets.append((f"{y:04d}-{m:02d}", date(y, m, 1).isoformat(), date(y, m, last).isoformat()))
+    return buckets
+
+
+def pull_sale_history(
+    microlocalities: list[str],
+    *,
+    years: int = 4,
+    pages_per_bucket: int = 2,
+    client: UAERealEstateClient | None = None,
+    max_calls: int | None = None,
+    dry_run: bool = False,
+    out_dir: Path = INTERIM_DIR,
+    raw_dir: Path = RAW_DIR,
+) -> dict:
+    """Date-stratified for-sale sample: query each community month-by-month.
+
+    Gives even temporal coverage (vs the recency-skewed depth-capped pull) for
+    reliable appreciation. ``dry_run`` returns the bucket plan + call estimate with
+    no API calls. Otherwise writes a long parquet of normalised sale records (with
+    their real dates) to ``out_dir`` and a raw JSONL audit trail to ``raw_dir``.
+    """
+    buckets = month_buckets(years)
+    if dry_run:
+        upper = len(microlocalities) * (1 + len(buckets) * pages_per_bucket)
+        return {
+            "communities": len(microlocalities),
+            "months": len(buckets),
+            "pages_per_bucket": pages_per_bucket,
+            "first_bucket": buckets[0],
+            "last_bucket": buckets[-1],
+            "est_calls_upper": upper,
+            "est_calls_note": "upper bound; stop-on-empty makes empty months cost 1 call",
+        }
+
+    own = client is None
+    client = client or UAERealEstateClient(max_calls=max_calls)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict] = []
+    try:
+        for name in microlocalities:
+            lid = client.location_id(name)
+            if lid is None:
+                log.warning("no location id for %r; skipping", name)
+                continue
+            before = len(records)
+            for label, start, end in buckets:
+                try:
+                    for row in client.iter_transactions(
+                        purpose="for-sale", location_ids=[lid],
+                        start_date=start, end_date=end, max_pages=pages_per_bucket,
+                    ):
+                        row["_microlocality"] = name
+                        row["_month"] = label
+                        records.append(row)
+                except (httpx.HTTPError, UAERealEstateError) as exc:
+                    log.warning("partial: %s/%s stopped early (%s)", name, label, exc)
+            log.info("%s: +%d records (total=%d, calls=%d)",
+                     name, len(records) - before, len(records), client.calls)
+
+        raw_path = raw_dir / f"sale_history_{years}y.jsonl"
+        with raw_path.open("w") as fh:
+            for r in records:
+                fh.write(json.dumps(r, default=str) + "\n")
+        out = out_dir / f"bayut_sale_history_{years}y.parquet"
+        normalize_transactions(records, purpose="for-sale").write_parquet(out)
+        log.info("wrote %s: %d rows (raw: %s; calls=%d)", out, len(records), raw_path, client.calls)
+        return {"path": out, "rows": len(records), "calls": client.calls}
+    finally:
+        if own:
+            client.close()

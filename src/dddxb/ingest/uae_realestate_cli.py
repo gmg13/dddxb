@@ -26,6 +26,7 @@ from dddxb.ingest.uae_realestate import (
     UAERealEstateClient,
     UAERealEstateError,
     pull,
+    pull_sale_history,
 )
 
 
@@ -45,10 +46,26 @@ def main(argv: list[str] | None = None) -> int:
                         help="page cap per microlocality×purpose (runaway guard)")
     parser.add_argument("--max-calls", type=int, default=None,
                         help="hard cap on total API calls this run (quota guard)")
+    parser.add_argument("--history", action="store_true",
+                        help="date-stratified for-sale history sample (for appreciation)")
+    parser.add_argument("--years", type=int, default=4, help="(history) years of monthly buckets")
+    parser.add_argument("--pages-per-bucket", type=int, default=2,
+                        help="(history) pages sampled per community-month (~20 sales/page)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="(history) print the bucket plan + call estimate; no API calls")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    micro = [m.strip() for m in args.microlocalities.split(",") if m.strip()]
+
+    # Dry-run needs no key/client — print the plan and stop.
+    if args.history and args.dry_run:
+        plan = pull_sale_history(micro, years=args.years,
+                                 pages_per_bucket=args.pages_per_bucket, dry_run=True)
+        print(json.dumps(plan, indent=2, default=str))
+        return 0
 
     try:
         client = UAERealEstateClient(provider=args.provider, max_calls=args.max_calls)
@@ -57,7 +74,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        if args.probe:
+        if args.history:
+            pull_sale_history(micro, years=args.years,
+                              pages_per_bucket=args.pages_per_bucket, client=client)
+        elif args.probe:
             sample = {
                 "autocomplete": client.autocomplete(args.query),
                 "transactions_for_sale": client.transactions(purpose="for-sale", page=1),
@@ -65,7 +85,6 @@ def main(argv: list[str] | None = None) -> int:
             }
             print(json.dumps(sample, indent=2, default=str)[:6000])
         else:
-            micro = [m.strip() for m in args.microlocalities.split(",") if m.strip()]
             purposes = tuple(s.strip() for s in args.purposes.split(",") if s.strip())
             pull(micro, months=args.months, purposes=purposes,
                  client=client, max_pages=args.max_pages)

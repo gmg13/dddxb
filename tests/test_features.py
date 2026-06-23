@@ -7,7 +7,12 @@ from datetime import date, timedelta
 import polars as pl
 
 from dddxb.clean.transactions import clean_rents, clean_sales
-from dddxb.features.metrics import build_cohort_metrics, rank_microlocalities
+from dddxb.features.metrics import (
+    appreciation_from_history,
+    build_cohort_metrics,
+    rank_microlocalities,
+)
+from dddxb.ingest.uae_realestate import month_buckets
 
 
 def _sale_row(micro, ptype, beds, price, size, d):
@@ -65,3 +70,30 @@ def test_yield_and_appreciation():
 
     ranking = rank_microlocalities(cohorts)
     assert ranking.height == 1 and ranking.row(0, named=True)["microlocality"] == "Al Jaddaf"
+
+
+def test_month_buckets_count_and_edges():
+    b = month_buckets(years=4, today=date(2026, 6, 23))
+    assert len(b) == 48
+    assert b[-1] == ("2026-06", "2026-06-01", "2026-06-30")   # current month
+    assert b[0][0] == "2022-07"                                # 48 months back
+    assert b[0][1] == "2022-07-01" and b[0][2] == "2022-07-31"
+
+
+def test_appreciation_from_history_recovers_trend():
+    # 24 months of 1BR sales at +1%/month psf (price rises, size fixed at 1000 sqft)
+    rows = []
+    for k in range(24):
+        total = 2024 * 12 + k  # months from Jan 2024
+        y, m = divmod(total, 12)
+        d = date(y, m + 1, 15)
+        psf = 1000 * (1.01 ** k)
+        for j in range(8):  # >= min_per_month; distinct rows (vary building) so dedup keeps them
+            rows.append({"microlocality": "Test", "purpose": "for-sale", "date": d,
+                         "price": psf * 1000, "area": f"Test Tower {j}",
+                         "property_type": "apartments", "size": 1000.0, "beds": "1"})
+    appr = appreciation_from_history(pl.DataFrame(rows), windows=(12,), min_per_month=5)
+    row = appr.row(0, named=True)
+    # 12 months of +1%/mo compounding -> (1.01^12)^(12/12) - 1 ~= 12.7%
+    assert abs(row["ann_appr_12m"] - (1.01 ** 12 - 1)) < 0.005
+    assert row["cagr"] is not None and row["months_covered"] == 24
