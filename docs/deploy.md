@@ -31,13 +31,16 @@ zero cost. It auto-redeploys on every push to the configured branch.
    ```toml
    app_password = "choose-a-shared-password"
    ANTHROPIC_API_KEY = "sk-ant-..."
+   # max_chat_messages = 20   # optional
    ```
 
    - `app_password` gates the whole app (anyone with the link must enter it). Remove it
      to make the app fully public.
    - `ANTHROPIC_API_KEY` powers the **Ask** chatbot. Omit it to disable chat (the rest
      of the app still works). Note: everyone who has the password shares this key's
-     usage — set a spend limit in the Anthropic console.
+     usage — use a **fresh key with a spend limit** set in the Anthropic console.
+   - `max_chat_messages` (optional, default 20) caps chatbot questions per browser
+     session, bounding API spend even if the link leaks.
 4. **Deploy.** First build takes a couple of minutes; subsequent pushes redeploy
    automatically. The app sleeps after inactivity and cold-starts (~30s) on next visit.
 
