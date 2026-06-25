@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 
+import numpy as np
 import polars as pl
 
 from dddxb.clean.transactions import COHORT_KEYS, clean_sales
@@ -109,13 +110,19 @@ def build_cohort_metrics(
     return out
 
 
-def monthly_psf(history: pl.DataFrame, *, min_per_month: int = 5) -> pl.DataFrame:
+def monthly_psf(
+    history: pl.DataFrame, *, min_per_month: int = 5, apartments_only: bool = False
+) -> pl.DataFrame:
     """Median AED/sqft per microlocality per month from the sale-history sample.
 
     Cleans first (trims outliers, adds psf), then keeps only months with enough
     sales for a stable median. psf controls for unit-size mix across months.
+    ``apartments_only`` restricts to the dominant, comparable product so the
+    series isn't whipsawed by villa/penthouse mix shifts (use for appreciation).
     """
     df = clean_sales(history)
+    if apartments_only:
+        df = df.filter(pl.col("property_type") == "apartments")
     return (
         df.with_columns(pl.col("date").dt.strftime("%Y-%m").alias("ym"))
         .group_by(["microlocality", "ym"])
@@ -171,22 +178,58 @@ def appreciation_from_history(
     return pl.DataFrame(rows)
 
 
-def apply_history_appreciation(
-    ranking: pl.DataFrame, history: pl.DataFrame, *, headline_window: int = 12
+def appreciation_ols(
+    history: pl.DataFrame, *, min_per_month: int = 5, min_months: int = 12
 ) -> pl.DataFrame:
-    """Replace the ranking's appreciation with the reliable history-based figure.
+    """Robust annualized appreciation per microlocality via a log-linear OLS fit.
 
-    Uses the ``headline_window``-month annualized appreciation as ``ann_appr`` and
-    recomputes ``total_return = net_yield + ann_appr``; carries ``cagr`` too.
+    Fits ``ln(median apartment psf) ~ month`` over the whole covered span and
+    annualizes the slope (``exp(12*slope) - 1``). Using every month (not two
+    endpoints) and a per-month median makes this far more stable than a
+    single-month point-to-point ratio, which is dominated by product-mix noise in
+    heterogeneous communities (e.g. Meydan reads +56% point-to-point vs a sane
+    ~19% here). ``appr_r2`` is the fit quality — low R² means the community's psf
+    is too noisy/mixed to trust the trend, so lean on the sample validator.
     """
-    appr = appreciation_from_history(history, windows=(3, 6, headline_window))
-    col = f"ann_appr_{headline_window}m"
+    series = monthly_psf(history, min_per_month=min_per_month, apartments_only=True)
+    rows: list[dict] = []
+    for name in series["microlocality"].unique().to_list():
+        g = series.filter(pl.col("microlocality") == name).sort("ym")
+        if g.height < min_months:
+            continue
+        x = np.array([_month_index(v) for v in g["ym"].to_list()], dtype=float)
+        psf = g["psf"].to_numpy()
+        y = np.log(psf)
+        slope, intercept = np.polyfit(x, y, 1)
+        resid = y - (intercept + slope * x)
+        ss_tot = float(((y - y.mean()) ** 2).sum())
+        r2 = 1.0 - float((resid**2).sum()) / ss_tot if ss_tot > 0 else None
+        rows.append({
+            "microlocality": name,
+            "cagr": float(np.exp(12 * slope) - 1),
+            "appr_r2": r2,
+            "psf_latest": float(psf[-1]),
+            "months_covered": int(g.height),
+        })
+    return pl.DataFrame(rows) if rows else pl.DataFrame(
+        schema={"microlocality": pl.String, "cagr": pl.Float64, "appr_r2": pl.Float64,
+                "psf_latest": pl.Float64, "months_covered": pl.Int64}
+    )
+
+
+def apply_history_appreciation(ranking: pl.DataFrame, history: pl.DataFrame) -> pl.DataFrame:
+    """Replace the ranking's appreciation with the robust OLS-CAGR history figure.
+
+    Sets ``ann_appr`` to the log-linear CAGR from :func:`appreciation_ols`, carries
+    ``appr_r2`` (confidence) and ``psf_latest``, and recomputes
+    ``total_return = net_yield + ann_appr``.
+    """
+    appr = appreciation_ols(history)
     out = (
-        ranking.join(appr.select(["microlocality", col, "cagr", "psf_latest"]),
+        ranking.join(appr.select(["microlocality", "cagr", "appr_r2", "psf_latest"]),
                      on="microlocality", how="left")
-        .with_columns(pl.col(col).alias("ann_appr"))
+        .with_columns(pl.col("cagr").alias("ann_appr"))
         .with_columns((pl.col("net_yield") + pl.col("ann_appr").fill_null(0.0)).alias("total_return"))
-        .drop(col)
         .sort("total_return", descending=True)
     )
     return out
