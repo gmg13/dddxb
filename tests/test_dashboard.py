@@ -5,6 +5,7 @@ from __future__ import annotations
 import polars as pl
 
 from dddxb.dashboard import chat, samples
+from dddxb.dashboard import data as ddata
 
 
 def test_build_system_prompt_embeds_tables():
@@ -46,6 +47,22 @@ def test_api_key_missing_raises(monkeypatch):
         assert "ANTHROPIC_API_KEY" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected ChatUnavailable")
+
+
+def test_resolve_prefers_live_then_published(tmp_path, monkeypatch):
+    pub = tmp_path / "published"
+    pub.mkdir()
+    (pub / "x.parquet").write_bytes(b"data")
+    monkeypatch.setattr(ddata, "PUBLISHED_DIR", pub)
+    # primary missing -> falls back to published snapshot by basename
+    assert ddata._resolve(tmp_path / "processed" / "x.parquet") == pub / "x.parquet"
+    # neither present -> None
+    assert ddata._resolve(tmp_path / "processed" / "missing.parquet") is None
+    # primary present -> used as-is
+    live = tmp_path / "processed" / "x.parquet"
+    live.parent.mkdir()
+    live.write_bytes(b"live")
+    assert ddata._resolve(live) == live
 
 
 def test_split_area_segments():
