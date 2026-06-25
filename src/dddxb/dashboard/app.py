@@ -38,6 +38,19 @@ def _bridge_secrets() -> None:
             os.environ[name] = str(val)
 
 
+# Cap chatbot questions per browser session to bound API spend on a shared deploy.
+# Override with a `max_chat_messages` secret.
+DEFAULT_CHAT_LIMIT = 20
+
+
+def _chat_limit() -> int:
+    val = _secret("max_chat_messages")
+    try:
+        return max(1, int(val))
+    except (TypeError, ValueError):
+        return DEFAULT_CHAT_LIMIT
+
+
 def _gate() -> bool:
     """Password gate when ``app_password`` is set as a secret; open otherwise (local)."""
     expected = _secret("app_password")
@@ -288,6 +301,13 @@ def _ask(ranking, cohorts) -> None:
     for msg in st.session_state.chat:
         st.chat_message(msg["role"]).markdown(msg["content"])
 
+    limit = _chat_limit()
+    asked = sum(1 for m in st.session_state.chat if m["role"] == "user")
+    st.caption(f"Questions this session: {asked}/{limit}")
+    if asked >= limit:
+        st.info(f"Session question limit reached ({limit}). Refresh the page to start over.")
+        return
+
     if prompt := st.chat_input("e.g. Which microlocality has the best total return for 1BR?"):
         st.session_state.chat.append({"role": "user", "content": prompt})
         st.chat_message("user").markdown(prompt)
@@ -301,6 +321,7 @@ def _ask(ranking, cohorts) -> None:
                 reply = f"⚠️ Chat error: {exc}"
             st.markdown(reply)
         st.session_state.chat.append({"role": "assistant", "content": reply})
+        st.rerun()
 
 
 if __name__ == "__main__":
