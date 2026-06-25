@@ -115,12 +115,14 @@ def main() -> None:
         _no_data(window)
         st.stop()
 
-    tab_overview, tab_validate, tab_detail, tab_cohort, tab_ask = st.tabs(
-        ["📊 Overview", "✅ Validate", "📍 Microlocality", "🧩 Cohorts", "💬 Ask"]
+    tab_overview, tab_yield, tab_validate, tab_detail, tab_cohort, tab_ask = st.tabs(
+        ["📊 Overview", "💰 Yield", "✅ Validate", "📍 Microlocality", "🧩 Cohorts", "💬 Ask"]
     )
 
     with tab_overview:
         _overview(ranking, top_n)
+    with tab_yield:
+        _yield(ranking, top_n)
     with tab_validate:
         _validate(ranking, window)
     with tab_detail:
@@ -186,6 +188,47 @@ def _overview(ranking, top_n: int) -> None:
     st.dataframe(ranked, width="stretch", hide_index=True)
     st.download_button("Download ranking (CSV)", ranked.to_csv(index=False),
                        file_name="microlocality_ranking.csv", mime="text/csv")
+
+
+def _yield(ranking, top_n: int) -> None:
+    st.subheader(f"💰 Top {top_n} yield plays (highest net rental yield)")
+    st.caption("Ranked by **net rental yield** = gross rent ÷ price × (1 − 20% opex). "
+               "The appreciation / total-return columns show how the **capital-gain** "
+               "side looks for each play — high yield doesn't always come with high "
+               "price growth, so check both before committing.")
+    rk = ranking.to_pandas().sort_values("net_yield", ascending=False).head(top_n)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Best net yield", f"{rk['net_yield'].max() * 100:.2f}%")
+    c2.metric("Median net yield (top)", f"{rk['net_yield'].median() * 100:.2f}%")
+    if "ann_appr" in rk.columns:
+        c3.metric("Median appreciation (top)", f"{rk['ann_appr'].median() * 100:.2f}%")
+
+    st.subheader("Yield vs. capital gain, side by side")
+    value_cols = [c for c in ("net_yield", "ann_appr") if c in rk.columns]
+    melt = rk.melt(id_vars="microlocality", value_vars=value_cols,
+                   var_name="metric", value_name="val")
+    melt["val"] = (melt["val"] * 100).round(2)
+    melt["metric"] = melt["metric"].map({"net_yield": "Net yield",
+                                         "ann_appr": "Appreciation (capital gain)"})
+    order = rk.sort_values("net_yield")["microlocality"].tolist()  # highest at top
+    fig = px.bar(melt, x="val", y="microlocality", color="metric", orientation="h",
+                 barmode="group", labels={"val": "% per year", "microlocality": "", "metric": ""})
+    fig.update_yaxes(categoryorder="array", categoryarray=order)
+    st.plotly_chart(fig, width="stretch")
+
+    st.subheader("Detail")
+    cols = ["microlocality", "n_sales", "n_rents", "gross_yield", "net_yield",
+            "ann_appr", "total_return", "appr_r2", "med_psf"]
+    table = _pct(rk[[c for c in cols if c in rk.columns]], PCT_COLS)
+    if "appr_r2" in table.columns:
+        table["appr_r2"] = table["appr_r2"].round(2)
+    st.dataframe(table, width="stretch", hide_index=True)
+    st.caption("`appr_r2` is the price-trend fit confidence (0–1); low values mean the "
+               "capital-gain figure is noisy — open the Microlocality tab for its 4-year "
+               "price trend, or the Validate tab for sample buildings.")
+    st.download_button("Download yield plays (CSV)", table.to_csv(index=False),
+                       file_name="yield_plays.csv", mime="text/csv")
 
 
 def _validate(ranking, window: int) -> None:
