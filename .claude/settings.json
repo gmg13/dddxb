@@ -1,5 +1,8 @@
 {
   "permissions": {
     "defaultMode": "plan"
+  },
+  "enabledPlugins": {
+    "code-review@claude-plugins-official": true
   }
 }
