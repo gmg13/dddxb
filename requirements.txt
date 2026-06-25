@@ -1,0 +1,11 @@
+# Runtime deps for the Streamlit Cloud deploy (dashboard only).
+# Intentionally minimal — excludes the pipeline's heavy geo/ML deps (geopandas/GDAL,
+# scikit-learn, statsmodels, duckdb, httpx) that the dashboard import chain never touches.
+# The full project env is managed with uv (pyproject.toml) for local dev.
+streamlit>=1.40
+plotly>=5.24
+polars>=1.0
+pandas>=2.2
+pyarrow>=17
+numpy>=2.0
+anthropic>=0.40

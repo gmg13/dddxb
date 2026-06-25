@@ -8,6 +8,8 @@ Reads processed parquet (run ``python -m dddxb.features --months 12`` first) and
 
 from __future__ import annotations
 
+import os
+
 import plotly.express as px
 import streamlit as st
 
@@ -16,6 +18,41 @@ from dddxb.dashboard import chat, data, samples
 st.set_page_config(page_title="dddxb — Dubai property analytics", layout="wide")
 
 PCT_COLS = ("gross_yield", "net_yield", "ann_appr", "cagr", "total_return")
+# Secrets bridged from st.secrets (Streamlit Cloud) into os.environ so the chatbot's
+# config.get_secret() resolves them like a local export.
+_BRIDGED_SECRETS = ("ANTHROPIC_API_KEY",)
+
+
+def _secret(name: str):
+    """Read a Streamlit secret without exploding when no secrets file exists."""
+    try:
+        return st.secrets.get(name)
+    except Exception:
+        return None
+
+
+def _bridge_secrets() -> None:
+    for name in _BRIDGED_SECRETS:
+        val = _secret(name)
+        if val and not os.environ.get(name):
+            os.environ[name] = str(val)
+
+
+def _gate() -> bool:
+    """Password gate when ``app_password`` is set as a secret; open otherwise (local)."""
+    expected = _secret("app_password")
+    if not expected:
+        return True
+    if st.session_state.get("_authed"):
+        return True
+    st.title("🔒 dddxb dashboard")
+    pw = st.text_input("Password", type="password")
+    if pw == expected:
+        st.session_state["_authed"] = True
+        st.rerun()
+    elif pw:
+        st.error("Incorrect password.")
+    return False
 
 
 def _pct(df, cols):
@@ -35,6 +72,9 @@ def _no_data(window: int) -> None:
 
 
 def main() -> None:
+    _bridge_secrets()
+    if not _gate():
+        return
     st.title("🏙️ dddxb — Dubai property investment analytics")
     st.caption(
         "Per-microlocality rental yield, price appreciation, and total return. "
