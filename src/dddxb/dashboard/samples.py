@@ -14,17 +14,19 @@ import polars as pl
 
 # Major Dubai developers → lowercase tokens found in development/building names.
 # Best-effort and extensible; first match wins, so order specific → generic.
+# NOTE: community-name tokens (e.g. "jumeirah village", "downtown") are deliberately
+# kept OUT of here — they false-positive every third-party building in that community
+# onto one developer. Single-developer communities are handled by COMMUNITY_MASTER
+# below, applied only as a last-resort fallback once no branded token matched.
 DEVELOPER_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "Emaar": ("emaar", "downtown", "burj khalifa", "dubai hills", "creek", "beachfront",
-              "arabian ranches", "blvd", "boulevard", "address", "vida", "the cove",
-              "elvira", "forte", "act one", "grande", "st. regis", "st regis", "park heights",
-              "collective", "mulberry", "executive heights", "the greens", "the views"),
+    "Emaar": ("emaar", "burj khalifa", "dubai hills", "creek", "beachfront",
+              "arabian ranches", "address", "vida", "the cove", "emaar south",
+              "elvira", "forte", "act one", "grande", "st. regis", "st regis",
+              "park heights", "collective", "mulberry", "executive heights"),
     "DAMAC": ("damac", "paramount", "cavalli", "safa", "akoya", "aykon", "canal heights",
               "zada", "merano", "reva", "prive"),
-    "Nakheel": ("nakheel", "palm jumeirah", "the crescent", "shoreline", "jumeirah village",
-                "jvc", "jvt", "jumeirah islands", "discovery gardens", "international city",
-                "jumeirah park", "the gardens"),
-    "Sobha": ("sobha", "hartland", "creek vistas", "one park avenue", "the crest"),
+    "Nakheel": ("nakheel", "palm jumeirah", "the crescent", "shoreline"),
+    "Sobha": ("sobha", "hartland", "creek vistas", "one park avenue", "the crest", "solis"),
     "Meraas": ("meraas", "city walk", "bluewaters", "port de la mer", "la mer", "jbr",
                "jumeirah beach residence", "central park"),
     "Select Group": ("select", "marina gate", "peninsula", "studio one", "no.9", "jumeirah living"),
@@ -32,11 +34,37 @@ DEVELOPER_KEYWORDS: dict[str, tuple[str, ...]] = {
     "Samana": ("samana",),
     "Azizi": ("azizi", "riviera", "mina by azizi"),
     "Danube": ("danube",),
-    "Ellington": ("ellington",),
-    "Omniyat": ("omniyat", "the opus", "one palm", "ava ", "langham"),
+    "Ellington": ("ellington", "hillgate"),
+    "Omniyat": ("omniyat", "the opus", "one palm", "langham"),
     "Dubai Properties": ("executive towers", "bay square", "mudon", "dubai wharf",
-                         "manazel", "town square", "nshama", "remraam"),
+                         "manazel", "remraam"),
+    "Nshama": ("nshama",),
+    "Deyaar": ("deyaar",),
+    "Iman": ("by iman",),
+    "Vision": ("by vision",),
+    "Karma": ("by karma",),
     "Tiger": ("tiger",),
+}
+
+# Developer tier (1 = top-tier established, 2 = active mid-size). Gates the "blue-chip"
+# additions in the developer-ROI analysis. Curated, best-effort, adjustable.
+DEVELOPER_TIER: dict[str, int] = {
+    "Emaar": 1, "Nakheel": 1, "DAMAC": 1, "Meraas": 1, "Sobha": 1,
+    "Dubai Properties": 1, "Omniyat": 1, "Select Group": 1, "Ellington": 1,
+    "Nshama": 1, "Union Properties": 1,
+    "Binghatti": 2, "Azizi": 2, "Danube": 2, "Samana": 2, "Tiger": 2,
+    "Deyaar": 2, "Iman": 2, "Vision": 2, "Karma": 2,
+}
+
+# Single-developer master communities: stock not matched by a branded token above is
+# safely attributed to the master developer. Only communities with effectively one
+# developer belong here — NOT mixed communities (JVC, Motor City, …) where a blanket
+# fallback would over-attribute to the master.
+COMMUNITY_MASTER: dict[str, str] = {
+    "town square": "Nshama",
+    "discovery gardens": "Nakheel",
+    "the greens": "Emaar",
+    "international city": "Nakheel",
 }
 
 
@@ -56,15 +84,30 @@ def split_area(area: str | None) -> tuple[str | None, str | None, str | None]:
     return community, development, building
 
 
-def developer_for(development: str | None, building: str | None = None) -> str | None:
-    """Best-effort big-developer tag from development + building text, or None."""
+def developer_for(
+    development: str | None,
+    building: str | None = None,
+    community: str | None = None,
+) -> str | None:
+    """Best-effort big-developer tag, or None.
+
+    Branded tokens in development/building win first; if nothing matches and the
+    ``community`` is a known single-developer master community, attribute to its
+    master developer (COMMUNITY_MASTER) as a last resort.
+    """
     text = f"{development or ''} {building or ''}".lower()
-    if not text.strip():
-        return None
-    for developer, tokens in DEVELOPER_KEYWORDS.items():
-        if any(tok in text for tok in tokens):
-            return developer
+    if text.strip():
+        for developer, tokens in DEVELOPER_KEYWORDS.items():
+            if any(tok in text for tok in tokens):
+                return developer
+    if community:
+        return COMMUNITY_MASTER.get(community.strip().lower())
     return None
+
+
+def developer_tier(developer: str | None) -> int | None:
+    """Tier (1/2) for a developer name, or None if unknown/untiered."""
+    return DEVELOPER_TIER.get(developer) if developer else None
 
 
 def _with_parts(df: pl.DataFrame) -> pl.DataFrame:

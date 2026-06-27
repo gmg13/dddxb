@@ -3,7 +3,8 @@
     uv run streamlit run src/dddxb/dashboard/app.py
 
 Reads processed parquet (run ``python -m dddxb.features --months 12`` first) and the
-4-year sale-history sample. Tabs: Overview, Microlocality detail, Cohort explorer, Ask.
+4-year sale-history sample. Tabs: Overview, Yield, Validate, Developers, Microlocality
+detail, Cohort explorer, Ask.
 """
 
 from __future__ import annotations
@@ -11,8 +12,10 @@ from __future__ import annotations
 import os
 
 import plotly.express as px
+import polars as pl
 import streamlit as st
 
+from dddxb.analysis import developer_roi
 from dddxb.dashboard import chat, data, samples
 
 st.set_page_config(page_title="dddxb — Dubai property analytics", layout="wide")
@@ -77,6 +80,13 @@ def _pct(df, cols):
     return out
 
 
+@st.cache_data(show_spinner=False)
+def _tagged_sales(window: int):
+    """Cleaned sales with an inferred ``developer`` column (cached per window)."""
+    sales = data.load_clean_sales(window)
+    return developer_roi.tag_developers(sales) if sales is not None else None
+
+
 def _no_data(window: int) -> None:
     st.warning(
         f"No ranking found for the {window}-month window. Run the pipeline first:\n\n"
@@ -115,8 +125,10 @@ def main() -> None:
         _no_data(window)
         st.stop()
 
-    tab_overview, tab_yield, tab_validate, tab_detail, tab_cohort, tab_ask = st.tabs(
-        ["📊 Overview", "💰 Yield", "✅ Validate", "📍 Microlocality", "🧩 Cohorts", "💬 Ask"]
+    (tab_overview, tab_yield, tab_validate, tab_devs, tab_detail, tab_cohort,
+     tab_ask) = st.tabs(
+        ["📊 Overview", "💰 Yield", "✅ Validate", "🏗️ Developers", "📍 Microlocality",
+         "🧩 Cohorts", "💬 Ask"]
     )
 
     with tab_overview:
@@ -125,6 +137,8 @@ def main() -> None:
         _yield(ranking, top_n)
     with tab_validate:
         _validate(ranking, window)
+    with tab_devs:
+        _developers(ranking, window)
     with tab_detail:
         _detail(ranking, cohorts)
     with tab_cohort:
@@ -263,6 +277,72 @@ def _validate(ranking, window: int) -> None:
                 "dev_n_sales": "dev #sales", "dev_med_psf": "dev med psf",
                 "dev_impl_yield": "implied yield %", "psf": "unit psf"})
             st.dataframe(disp, width="stretch", hide_index=True)
+
+
+def _k(x) -> str:
+    if x is None:
+        return "—"
+    return f"{x / 1_000_000:.2f}M" if x >= 1_000_000 else f"{x / 1_000:.0f}k"
+
+
+def _developers(ranking, window: int) -> None:
+    st.subheader("🏗️ Top developers by rent & ROI")
+    st.caption(
+        "For the 10 highest-value microlocalities (top 5 by net yield ∪ top 5 by "
+        "appreciation): which developers give the best **net rental yield**. Yield is "
+        "**bed-band matched** — community median rent(bed) ÷ developer median price(bed) "
+        "× (1 − 20% opex) — because the sale stock (new launches) and rent stock (older "
+        "completed buildings) are largely different buildings, so *rent is "
+        "location-driven and the ROI differentiator is price*. **Top** = best 2 by net "
+        "yield; **blue-chip** = 2 more established names (tier 1/2, ≥4 Dubai properties). "
+        "Developers are inferred from building names (DLD has no developer field)."
+    )
+    sales = _tagged_sales(window)
+    rents = data.load_clean_rents(window)
+    if sales is None or rents is None:
+        st.warning(f"No cleaned transactions for the {window}m window — run "
+                   f"`uv run python -m dddxb.features --months {window}`.")
+        return
+
+    dubai_counts = developer_roi.dubai_property_counts(sales)
+    targets = developer_roi.target_microlocalities(ranking, n=10)
+    rk = (ranking.filter(pl.col("microlocality").is_in(targets))
+          .sort("total_return", descending=True))
+
+    for i, row in enumerate(rk.iter_rows(named=True)):
+        name = row["microlocality"]
+        appr = (f", appreciation {row['ann_appr'] * 100:.1f}%"
+                if row.get("ann_appr") is not None else "")
+        head = f"{name} — net yield {row['net_yield'] * 100:.1f}%{appr}"
+        with st.expander(head, expanded=(i == 0)):
+            tbl = developer_roi.developer_table(sales, rents, name, dubai_counts=dubai_counts)
+            chosen = developer_roi.select_four(tbl)
+            if chosen.is_empty():
+                st.info("No developer cleared the volume floor (≥4 sales).")
+                continue
+            disp = chosen.to_pandas()
+            for c in ("gross_yield", "net_yield"):
+                disp[c] = (disp[c] * 100).round(2)
+            disp["med_price"] = disp["med_price"].map(lambda v: f"{v:,.0f}")
+            disp["est_annual_rent"] = disp["est_annual_rent"].map(lambda v: f"{v:,.0f}")
+            disp = disp[["developer", "tier", "role", "n_sales", "dubai_props",
+                         "med_price", "est_annual_rent", "net_yield"]].rename(columns={
+                "n_sales": "#sales", "dubai_props": "Dubai props",
+                "med_price": "med price", "est_annual_rent": "est. annual rent",
+                "net_yield": "net yield %"})
+            st.dataframe(disp, width="stretch", hide_index=True)
+
+            st.markdown("**Example buildings behind these yields:**")
+            for dev in chosen["developer"].to_list():
+                ex = developer_roi.developer_examples(sales, rents, name, dev)
+                if ex.is_empty():
+                    continue
+                parts = [
+                    f"**{e['building']}** ({e['bed_band']}) {_k(e['med_price'])} → "
+                    f"~{_k(e['bed_rent'])} rent → **{e['net_yield'] * 100:.2f}%**"
+                    for e in ex.iter_rows(named=True)
+                ]
+                st.markdown(f"- _{dev}:_ " + " · ".join(parts))
 
 
 def _detail(ranking, cohorts) -> None:
